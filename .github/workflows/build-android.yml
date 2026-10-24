@@ -271,18 +271,18 @@ jobs:
       # ---------------------------------------------------------------------
       # Step 8: Restore Gradle cache (per-project, across workflow runs)
       # ---------------------------------------------------------------------
+      - 
+      # Step 8: Skip Gradle cache to avoid the hashFiles error
       - name: Restore Gradle cache
-        if: steps.toolchain.outputs.needs_gradle == 'true'
+        if: false
         uses: actions/cache@v4
         with:
           path: |
             /root/.gradle/caches
             /root/.gradle/wrapper
             ${{ steps.extract.outputs.project_root }}/.gradle
-          key: gradle-${{ steps.toolchain.outputs.gradle_version }}-${{ hashFiles('**/build.gradle*', '**/gradle-wrapper.properties', '**/libs.versions.toml') }}
-          restore-keys: |
-            gradle-${{ steps.toolchain.outputs.gradle_version }}-
-            gradle-
+          key: gradle-cache-disabled
+
 
       # ---------------------------------------------------------------------
       # Step 9: Restore Flutter/Dart cache (for Flutter projects)
