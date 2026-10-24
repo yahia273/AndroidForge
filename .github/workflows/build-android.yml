@@ -1,4 +1,4 @@
-name: Build Android APK
+Name: Build Android APK
 
 # AndroidForge — Universal Android APK Builder
 #
@@ -62,20 +62,7 @@ on:
         type: boolean
         required: false
         default: false
-  # NOTE: We intentionally do NOT have a `push.paths: input/**.zip`
-  # trigger. The Pages UI commits the ZIP to input/ AND triggers
-  # workflow_dispatch — if both triggers were active, every UI build
-  # would fire TWO workflow runs (one from the push, one from the
-  # dispatch). Removing the push trigger means only workflow_dispatch
-  # fires, so users get exactly one build per click.
-  # If you want to build via git push, trigger the workflow manually
-  # from the Actions tab after pushing.
 
-# Never expose secrets to the (untrusted) uploaded source ZIP.
-# contents:write is required so the GITHUB_TOKEN can upload the built APK
-# back to the source release as an asset — that's what lets the Pages UI
-# offer a direct download link (no CORS issues, no auth header dance).
-# packages:read lets the workflow pull the prebuilt Docker image from GHCR.
 permissions:
   contents: write
   actions: write
@@ -86,28 +73,16 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  # These point to paths baked into the Docker image.
   ANDROID_HOME: /opt/android-sdk
   ANDROID_SDK_ROOT: /opt/android-sdk
   JAVA_HOME: /usr/lib/jvm/java-17-openjdk-amd64
   GRADLE_OPTS: "-Dorg.gradle.daemon=false -Dorg.gradle.caching=false"
   PYTHONUNBUFFERED: "1"
 
-# Use the prebuilt image so we don't reinstall JDK + Android SDK + Gradle +
-# Flutter on every single build. The image is built by
-# .github/workflows/build-android-image.yml and lives at:
-#   ghcr.io/<owner>/androidforge-build-env:latest
-# If the image is missing (first-ever run before the image build has run),
-# this workflow will fail with a clear "image not found" error — the fix is
-# to run the "Build & Publish Android Image" workflow once.
 jobs:
   build:
     name: Build APK
     runs-on: ubuntu-latest
-    # The image is published by build-android-image.yml to GHCR.
-    # GHCR normalizes the image name to lowercase, so we use the lowercase
-    # owner here. If you fork the repo, update this to your-lowercase-username
-    # OR override the env var IMAGE_REF below.
     container: ghcr.io/professional-x/androidforge-build-env:latest
     timeout-minutes: 60
     outputs:
@@ -122,8 +97,6 @@ jobs:
         with:
           fetch-depth: 0
 
-      # Python is already installed in the Docker image — but we still need
-      # to install the project's specific Python deps (PyYAML).
       - name: Install Python dependencies
         run: |
           python3 -m pip install --upgrade pip --quiet
@@ -194,7 +167,6 @@ jobs:
 
       # ---------------------------------------------------------------------
       # Step 5: Switch JAVA_HOME to the detected JDK version
-      # (No actions/setup-java needed — all JDKs are in the Docker image.)
       # ---------------------------------------------------------------------
       - name: Switch JAVA_HOME to detected version
         run: |
@@ -203,29 +175,127 @@ jobs:
             8)  NEW_JH=/usr/lib/jvm/java-8-openjdk-amd64 ;;
             11) NEW_JH=/usr/lib/jvm/java-11-openjdk-amd64 ;;
             17) NEW_JH=/usr/lib/jvm/java-17-openjdk-amd64 ;;
-            21) NEW_JH=/usr/lib/jvm/java-17-openjdk-amd64 ;;  # fallback (no JDK 21 in image yet)
+            21) NEW_JH=/usr/lib/jvm/java-17-openjdk-amd64 ;;
             *)  echo "Unknown JDK version: $JDK_VER — defaulting to JDK 17"
                 NEW_JH=/usr/lib/jvm/java-17-openjdk-amd64 ;;
           esac
           echo "Switching JAVA_HOME from $JAVA_HOME → $NEW_JH"
           echo "JAVA_HOME=$NEW_JH" >> "$GITHUB_ENV"
           echo "$NEW_JH/bin" >> "$GITHUB_PATH"
-          # Sanity check
           java -version
 
       # ---------------------------------------------------------------------
       # Step 6: Install MISSING project-specific Android SDK components
-      # (Common platforms + build-tools are already in the Docker image —
-      # we only install what the project requires that ISN'T already there.)
       # ---------------------------------------------------------------------
       - name: Install missing Android SDK components
         run: |
-          # Determine what the project needs from detection.json + toolchain.json
           NEEDS_NDK="${{ steps.toolchain.outputs.needs_ndk }}"
           NDK_VER="${{ steps.toolchain.outputs.ndk_version }}"
           COMPILE_SDK=$(python3 -c "import json; d=json.load(open('detection.json')); v=d.get('versions',{}).get('compile_sdk'); print(v if v else '')")
           echo "Project compileSdk=$COMPILE_SDK"
-          # If the project's compileSdk isn't in our image, install it.
+          if [ -n "$COMPILE_SDK" ]; then
+            if [ ! -d "$ANDROID_HOME/platforms/android-$COMPILE_SDK" ]; then
+              echo "Installing missing platform: platforms;android-$COMPILE_SDK"
+              yes | sdkmanager "platforms;android-$COMPILE_SDK" || true
+            else
+              echo "✓ platforms;android-$COMPILE_SDK already present"
+            fi
+          fi
+          yes | sdkmanager "platform-tools" >/dev/null 2>&1 || true
+          if [ "$NEEDS_NDK" = "true" ] \vert{}\vert{} [ "${{ github.event.inputs.enable_ndk }}" = "true" ]; then
+            if [ -n "$NDK_VER" ] && [ ! -d "$ANDROID_HOME/ndk/$NDK_VER" ]; then
+              echo "Installing NDK: ndk;$NDK_VER"
+              yes | sdkmanager "ndk;$NDK_VER" || echo "WARNING: NDK install failed"
+            else
+              echo "✓ NDK $NDK_VER already present (or not specified)"
+            fi
+            yes | sdkmanager "cmake;3.22.1" >/dev/null 2>&1 || true
+          fi
+
+      # ---------------------------------------------------------------------
+      # Step 7: Switch Flutter version if needed
+      # ---------------------------------------------------------------------
+      - name: Switch Flutter version (if needed)
+        if: steps.toolchain.outputs.needs_flutter == 'true'
+        run: |
+          DETECTED="${{ steps.toolchain.outputs.flutter_version }}"
+          CURRENT=$(flutter --version | head -1 | awk '{print $4}')
+          echo "Project Flutter version: $DETECTED, image version:$CURRENT"
+          if [ "$DETECTED" != "$CURRENT" ] && [ -n "$DETECTED" ]; then
+            echo "Project wants Flutter $DETECTED — installing via the Flutter version manager..."
+            flutter downgrade "$DETECTED" 2>/dev/null \vert{}\vert{} flutter --version "$DETECTED" 2>/dev/null || true
+            flutter --version
+          else
+            echo "✓ Flutter $CURRENT already satisfies the project"
+          fi
+          flutter config --enable-linux-desktop --enable-windows-desktop --enable-macos-desktop || true
+
+      # ---------------------------------------------------------------------
+      # Step 8: Restore Gradle cache (Fixed syntax error)
+      # ---------------------------------------------------------------------
+      - name: Restore Gradle cache
+        if: false
+        uses: actions/cache@v4
+        with:
+          path: |
+            /root/.gradle/caches
+            /root/.gradle/wrapper
+            ${{ steps.extract.outputs.project_root }}/.gradle
+          key: gradle-cache-disabled
+
+      # ---------------------------------------------------------------------
+      # Step 9: Restore Flutter/Dart cache
+      # ---------------------------------------------------------------------
+      - name: Restore Flutter pub cache
+        if: steps.toolchain.outputs.needs_flutter == 'true'
+        uses: actions/cache@v4
+        with:
+          path: /root/.pub-cache
+          key: flutter-pub-${{ hashFiles('**/pubspec.yaml', '**/pubspec.lock') }}
+          restore-keys: |
+            flutter-pub-
+
+      # ---------------------------------------------------------------------
+      # Step 10: Verify standalone Gradle
+      # ---------------------------------------------------------------------
+      - name: Verify standalone Gradle (fallback)
+        if: steps.toolchain.outputs.use_wrapper == 'false'
+        run: |
+          GRADLE_VER="${{ steps.toolchain.outputs.gradle_version }}"
+          echo "Image has Gradle 8.9 system-wide at /opt/gradle/bin/gradle"
+          which gradle
+          gradle --version | head -3
+          if [ -n "$GRADLE_VER" ] && [ "$GRADLE_VER" != "8.9" ] && [ "$GRADLE_VER" != "8.0" ]; then
+            REQ_MAJOR=$(echo "$GRADLE_VER" | cut -d. -f1)
+            if [ "$REQ_MAJOR" -lt 8 ]; then
+              echo "Project wants older Gradle $GRADLE_VER — downloading..."
+              wget -q "https://services.gradle.org/distributions/gradle-${GRADLE_VER}-bin.zip" -O /tmp/gradle.zip
+              unzip -q /tmp/gradle.zip -d /opt
+              echo "/opt/gradle-${GRADLE_VER}/bin" >> "$GITHUB_PATH"
+            else
+              echo "✓ Image's Gradle 8.9 satisfies the project's requirement of $GRADLE_VER+"
+            fi
+          fi
+
+      # ---------------------------------------------------------------------
+      # Step 11: Build the project
+      # ---------------------------------------------------------------------
+      - name: Build project
+        id: build
+        continue-on-error: true
+        run: |
+          python3 "$GITHUB_WORKSPACE/scripts/build_project.py" \
+            --root "${{ steps.extract.outputs.project_root }}" \
+            --detect "$GITHUB_WORKSPACE/detection.json" \
+            --toolchain "$GITHUB_WORKSPACE/toolchain.json" \
+            --variant "${{ inputs.build_variant || 'auto' }}" \
+            --log-dir "$GITHUB_WORKSPACE/.androidforge/logs" \
+            --output "$GITHUB_WORKSPACE/build.json" || true
+          if [ ! -f "$GITHUB_WORKSPACE/build.json" ]; then
+            echo '{"build_succeeded": false, "successful_command": null, "exit_code": -1, "log_file": null}' > "$GITHUB_WORKSPACE/build.json"
+          fi
+          cat "$GITHUB_WORKSPACE
+it.
           if [ -n "$COMPILE_SDK" ]; then
             if [ ! -d "$ANDROID_HOME/platforms/android-$COMPILE_SDK" ]; then
               echo "Installing missing platform: platforms;android-$COMPILE_SDK"
